@@ -1,0 +1,19 @@
+*필수조건
+1. 작업 파일이 csv여야함.
+2. N열에 ID, O열에 VG, P열에 IG가 있는 양식이어야 함.(기본 양식)
+
+*단위 차원
+Width: Channel Width [um]
+Length: Channel Length [um]
+Capacitance: Dielectric Capacitance[F/cm^2]
+FV: On current
+   ex) p-type> 20~-40V의 경우 -40, n-type> -20~40V의 경우 40
+Point Count: 기울기 및 절편을 구하는데 사용할 점의 갯수
+   ex) 5개 > -40V,-39V,-38V,-37V,-36V(1V step으로 측정했을 시)
+
+출력 파일에서 mobility 및 다른 팩터가 0 또는 blank로 표시될 때에는
+FV나 ntype 체크, 데이터 파일을 열어둔 상태라 수정이 되지 않는 상태에서 실행을 한 것이므로,
+다시 확인할 것.
+
+버전추가
+vg가 소숫점이어도 사용가능
