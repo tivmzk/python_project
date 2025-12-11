@@ -65,8 +65,8 @@ def main():
         ,'3':'https://www.dju.ac.kr/dju/cm/cntnts/cntntsView.do?cntntsId=2643&mi=4323'
         ,'4':'https://www.dju.ac.kr/dju/cm/cntnts/cntntsView.do?cntntsId=2644&mi=4324'
         ,'5':'https://www.dju.ac.kr/dju/cm/cntnts/cntntsView.do?cntntsId=2645&mi=4325'
-        ,'6':'https://www.dju.ac.kr/dju/cm/cntnts/cntntsView.do?cntntsId=2645&mi=4325'
-        ,'7':'https://www.dju.ac.kr/dju/cm/cntnts/cntntsView.do?cntntsId=2645&mi=4325'
+        ,'6':'https://www.dju.ac.kr/dju/cm/cntnts/cntntsView.do?cntntsId=2646&mi=4326'
+        ,'7':'https://www.dju.ac.kr/dju/cm/cntnts/cntntsView.do?cntntsId=2647&mi=4327'
     }
 
     result = []
