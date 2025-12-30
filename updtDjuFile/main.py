@@ -23,8 +23,20 @@ def get_file_query_from_url(url, file_num_list):
         result = []
         find_td = soup.select('.tbl_st td')
         for file_num in file_num_list:
+            temp = ''
+            if file_num.startswith('3-1-2_'):
+                temp = file_num.split('_')[1]
+                file_num = '3-1-2'
+
             for td in find_td:
-                if file_num in td.get_text(strip=True):
+                if file_num == td.get_text(strip=True):
+                    sibling_text = td.find_next_sibling('td').find('a').get_text(strip=True)
+                    if temp == '1':
+                        if '기구표' not in sibling_text:
+                            continue
+                    elif temp == '2':
+                        if '직제규정' not in sibling_text:
+                            continue
                     print(file_num+' 발견')
                     href = td.find_next_sibling('td').find('a').attrs['href']
                     result.append(get_query('', href))
@@ -42,6 +54,9 @@ def main():
         file_num = input("파일 번호 : ")
         if file_num.strip() == "":
             break
+        if file_num == '3-1-2':
+            temp = input('추가 번호 입력 (1 기구표, 2 직제규정) : ')
+            file_num = file_num.strip() + '_' + temp.strip()
         file_nums.append(file_num.strip())
     print("새로 교체하는 파일의 경로를 입력, 빈칸 입력 시 다음으로 넘어감 예) /upload/cntntsFile/dju/doc_e67ca63f-b31e-4f35-b4bc-dba0a86a69b41712562087537.pdf : ")
     new_file_query = []
