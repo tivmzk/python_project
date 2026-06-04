@@ -1,0 +1,31 @@
+@echo off
+chcp 65001 >nul
+echo ========================================
+echo   일본어 번역기 패키지 설치
+echo ========================================
+echo.
+
+echo [1/5] winocr 설치 중...
+pip install winocr
+
+echo.
+echo [2/5] Playwright 설치 중...
+pip install playwright
+
+echo.
+echo [3/5] Playwright 브라우저 설치 중 (Chromium)...
+playwright install chromium
+
+echo.
+echo [4/5] 기타 패키지 설치 중...
+pip install keyboard pyperclip pillow
+
+echo.
+echo [5/5] 설치 완료!
+echo.
+echo ========================================
+echo   이제 translator.py 를 실행하세요
+echo   python translator.py
+echo ========================================
+echo.
+pause
