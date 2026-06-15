@@ -6,16 +6,17 @@
 """
 
 import asyncio
+import re
 import threading
 import queue
 import tkinter as tk
 import pyperclip
 import winocr
-from PIL import ImageGrab, Image
+from PIL import ImageGrab, Image, ImageEnhance
 import json
 import os
 import time
-from playwright.sync_api import sync_playwright, Page, Browser, Playwright
+from playwright.sync_api import sync_playwright
 
 # ── 설정 파일 경로 ──────────────────────────────────────────
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "translator_config.json")
@@ -45,6 +46,10 @@ PREPROCESS_PRESETS = [
 ]
 # 현재 선택된 전처리 프리셋 인덱스
 _preprocess_idx: int = 0
+
+# ── 미리 컴파일된 CJK 공백 제거 패턴 ────────────────────────
+_RE_CJK_SPACE_NL   = re.compile(r'(?<=[　-鿿＀-￯])\s+(?=[　-鿿＀-￯])')
+_RE_CJK_SPACE_NONL = re.compile(r'(?<=[　-鿿＀-￯])[^\S\n]+(?=[　-鿿＀-￯])')
 
 # ── 전역 상태 ───────────────────────────────────────────────
 capture_region      = None  # (x1, y1, x2, y2)
@@ -114,6 +119,25 @@ def save_config():
 # 브라우저 전용 워커 스레드
 # ══════════════════════════════════════════════════════════════
 
+def _launch_browser(playwright):
+    """Chrome → Edge 순으로 시도해 브라우저 인스턴스를 반환한다."""
+    for channel in ("chrome", "msedge"):
+        try:
+            browser = playwright.chromium.launch(
+                channel=channel,
+                headless=False,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            print(f"  ✅ {channel} 브라우저 사용")
+            return browser
+        except Exception:
+            continue
+    raise RuntimeError(
+        "Chrome 또는 Edge가 설치되어 있지 않습니다.\n"
+        "https://www.google.com/chrome 에서 Chrome을 설치해 주세요."
+    )
+
+
 def _browser_worker():
     """
     Playwright 전용 스레드.
@@ -126,27 +150,10 @@ def _browser_worker():
     # ── 초기화 ───────────────────────────────────────────────
     try:
         playwright = sync_playwright().start()
-        # 빌드 환경에서는 Playwright 번들 Chromium이 없으므로
-        # 시스템에 설치된 Chrome → Edge 순으로 fallback 시도
-        browser = None
-        for channel in ("chrome", "msedge"):
-            try:
-                browser = playwright.chromium.launch(
-                    channel=channel,
-                    headless=False,
-                    args=["--no-sandbox", "--disable-dev-shm-usage"]
-                )
-                print(f"  ✅ {channel} 브라우저 사용")
-                break
-            except Exception:
-                continue
-        if browser is None:
-            raise RuntimeError(
-                "Chrome 또는 Edge가 설치되어 있지 않습니다.\n"
-                "https://www.google.com/chrome 에서 Chrome을 설치해 주세요."
-            )
+        browser = _launch_browser(playwright)
         page = browser.new_page()
-        page.goto("https://papago.naver.com/?sk=ja&tk=ko",
+        _, sk0, tk0, _, _ = LANG_PAIRS[0]
+        page.goto(f"https://papago.naver.com/?sk={sk0}&tk={tk0}",
                   wait_until="domcontentloaded", timeout=20000)
         print("  ✅ 브라우저 준비 완료")
         if _root:
@@ -175,25 +182,12 @@ def _browser_worker():
                     if browser: browser.close()
                 except Exception:
                     pass
-                browser = None
-                for channel in ("chrome", "msedge"):
-                    try:
-                        browser = playwright.chromium.launch(
-                            channel=channel,
-                            headless=False,
-                            args=["--no-sandbox", "--disable-dev-shm-usage"]
-                        )
-                        break
-                    except Exception:
-                        continue
-                if browser is None:
-                    raise RuntimeError("Chrome 또는 Edge를 찾을 수 없습니다")
+                browser = _launch_browser(playwright)
                 page = browser.new_page()
                 page.goto(papago_url, wait_until="domcontentloaded", timeout=20000)
 
             # 언어 쌍이 달라졌거나 파파고가 아닌 경우 해당 언어 URL로 이동
-            expected_prefix = f"https://papago.naver.com/?sk={sk}&tk={tk_lang}"
-            if not page.url.startswith(expected_prefix):
+            if not page.url.startswith(papago_url):
                 page.goto(papago_url, wait_until="domcontentloaded", timeout=20000)
 
             # 입력창에 직접 텍스트 입력 (URL 파라미터 방식은 봇 감지에 취약)
@@ -289,15 +283,12 @@ def hide_region_overlay():
             pass
         _overlay = None
 
-def _withdraw_overlay():
+def _set_overlay_visibility(visible: bool):
     if _overlay:
-        try: _overlay.withdraw()
-        except Exception: pass
-
-def _deiconify_overlay():
-    if _overlay:
-        try: _overlay.deiconify()
-        except Exception: pass
+        try:
+            _overlay.deiconify() if visible else _overlay.withdraw()
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -384,26 +375,19 @@ def preprocess_image(image: Image.Image) -> Image.Image:
       3. 대비 강화  — 글자/배경 경계 명확화
       4. 선명도 강화 — 확대로 흐려진 엣지 복원
     """
-    from PIL import ImageEnhance
-
     _, _, scale, grayscale, contrast, sharpness = PREPROCESS_PRESETS[_preprocess_idx]
 
     # 전처리 없음 프리셋이면 원본 그대로 반환
     if scale == 1.0 and not grayscale and contrast == 1.0 and sharpness == 1.0:
         return image
 
-    # 1. 확대
     w, h = image.size
     image = image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    # 2. 그레이스케일 (선택)
     if grayscale:
         image = image.convert("L")
 
-    # 3. 대비 강화
     image = ImageEnhance.Contrast(image).enhance(contrast)
-
-    # 4. 선명도 강화
     image = ImageEnhance.Sharpness(image).enhance(sharpness)
 
     # WinOCR은 RGB 입력을 기대하므로 다시 변환
@@ -427,20 +411,24 @@ def clean_text(text: str, remove_cjk_spaces: bool = True) -> str:
     - 띄어쓰기 제거: _cfg_remove_space AND remove_cjk_spaces 모두 True일 때 적용
       (remove_cjk_spaces는 언어 쌍에 따른 자동 판단값)
     """
-    import re
     if _cfg_remove_newline:
         text = text.replace("\n", "").replace("\r", "")
     if _cfg_remove_space and remove_cjk_spaces:
-        # 일본어·중국어(히라가나·가타카나·한자·전각문자) 사이의 공백 제거
-        # 줄바꿈 제거가 OFF이면 \n은 건드리지 않는 패턴 사용
-        space_pat = r'\s+' if _cfg_remove_newline else r'[^\S\n]+'
-        text = re.sub(rf'(?<=[　-鿿＀-￯]){space_pat}(?=[　-鿿＀-￯])', '', text)
+        pat = _RE_CJK_SPACE_NL if _cfg_remove_newline else _RE_CJK_SPACE_NONL
+        text = pat.sub('', text)
     return text.strip()
 
 
 # ══════════════════════════════════════════════════════════════
 # 팝업 결과 창
 # ══════════════════════════════════════════════════════════════
+
+def _set_text_widget(widget: tk.Text, content: str):
+    widget.config(state="normal")
+    widget.delete("1.0", "end")
+    widget.insert("1.0", content)
+    widget.config(state="disabled")
+
 
 class ResultPopup:
     """번역 결과 창 — 단일 인스턴스로 재사용 (update로 내용 교체)"""
@@ -463,7 +451,7 @@ class ResultPopup:
 
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
-        px = min(sw - w - 20, sw - w)
+        px = sw - w - 20
         py = sh - h - 80
         self.win.geometry(f"{w}x{h}+{px}+{py}")
         self.win.minsize(480, 320)
@@ -545,19 +533,9 @@ class ResultPopup:
 
     def update(self, original: str, translated: str):
         """번역 내용 교체 — 창은 그대로 유지"""
-        # 번역 결과
-        self._trans_text.config(state="normal")
-        self._trans_text.delete("1.0", "end")
-        self._trans_text.insert("1.0", translated)
-        self._trans_text.config(state="disabled")
+        _set_text_widget(self._trans_text, translated)
+        _set_text_widget(self._orig_text, original)
 
-        # 원문
-        self._orig_text.config(state="normal")
-        self._orig_text.delete("1.0", "end")
-        self._orig_text.insert("1.0", original)
-        self._orig_text.config(state="disabled")
-
-        # 복사 버튼 커맨드 갱신
         def copy_translated():
             pyperclip.copy(translated)
             self._copy_btn.config(text="✓ 복사됨!")
@@ -565,7 +543,6 @@ class ResultPopup:
 
         self._copy_btn.config(command=copy_translated)
 
-        # 창 앞으로 올림
         self.win.lift()
         self.win.focus_force()
 
@@ -622,11 +599,11 @@ def run_translation():
         _root.after(0, lambda: show_toast("📸 캡처 & 텍스트 인식 중..."))
 
         # 오버레이가 스크린샷에 찍히지 않도록 잠깐 숨김
-        _root.after(0, _withdraw_overlay)
+        _root.after(0, lambda: _set_overlay_visibility(False))
         time.sleep(0.15)
 
         image    = ImageGrab.grab(bbox=capture_region)
-        _root.after(0, _deiconify_overlay)
+        _root.after(0, lambda: _set_overlay_visibility(True))
 
         image    = preprocess_image(image)
         raw_text = asyncio.run(do_ocr_lang(image, ocr_lang))
@@ -655,31 +632,25 @@ def run_translation():
 def on_translate_click():
     threading.Thread(target=run_translation, daemon=True).start()
 
-def on_region_click():
-    select_region()
+
+def _find_label_index(items: list, label: str) -> int:
+    for i, item in enumerate(items):
+        if item[0] == label:
+            return i
+    return 0
 
 def on_lang_change(*_):
-    """드롭다운 변경 시 호출 — 선택된 언어 쌍 인덱스를 저장"""
     global _lang_pair_idx
     if _lang_var is None:
         return
-    label = _lang_var.get()
-    for i, pair in enumerate(LANG_PAIRS):
-        if pair[0] == label:
-            _lang_pair_idx = i
-            break
+    _lang_pair_idx = _find_label_index(LANG_PAIRS, _lang_var.get())
     save_config()
 
 def on_preprocess_change(*_):
-    """전처리 드롭다운 변경 시 호출 — 선택된 프리셋 인덱스를 저장"""
     global _preprocess_idx
     if _preprocess_var is None:
         return
-    label = _preprocess_var.get()
-    for i, preset in enumerate(PREPROCESS_PRESETS):
-        if preset[0] == label:
-            _preprocess_idx = i
-            break
+    _preprocess_idx = _find_label_index(PREPROCESS_PRESETS, _preprocess_var.get())
     save_config()
 
 def on_text_option_change(*_):
@@ -717,14 +688,16 @@ def _quit_sequence():
 # ══════════════════════════════════════════════════════════════
 
 def update_region_label():
-    if _region_label and capture_region:
+    if not _region_label:
+        return
+    if capture_region:
         x1, y1, x2, y2 = capture_region
-        _region_label.config(
-            text=f"캡처 영역: ({x1}, {y1}) → ({x2}, {y2})  [{x2-x1}×{y2-y1}]",
-            fg="#00FF88"
-        )
-    elif _region_label:
-        _region_label.config(text="캡처 영역: 미설정", fg="#e94560")
+        text  = f"캡처 영역: ({x1}, {y1}) → ({x2}, {y2})  [{x2-x1}×{y2-y1}]"
+        color = "#00FF88"
+    else:
+        text  = "캡처 영역: 미설정"
+        color = "#e94560"
+    _region_label.config(text=text, fg=color)
 
 def update_status_label(msg: str):
     if _status_label:
@@ -738,6 +711,22 @@ def set_translate_btn_state(state: str):
 # ══════════════════════════════════════════════════════════════
 # 메인 GUI 창 빌드
 # ══════════════════════════════════════════════════════════════
+
+def _style_option_menu(menu: tk.OptionMenu, width: int = 26):
+    menu.config(
+        font=("Malgun Gothic", 9),
+        fg="white", bg="#0f3460",
+        activeforeground="white", activebackground="#1a4a8a",
+        relief="flat", cursor="hand2",
+        highlightthickness=0, bd=0,
+        anchor="w", width=width,
+    )
+    menu["menu"].config(
+        font=("Malgun Gothic", 9),
+        fg="white", bg="#0f3460",
+        activeforeground="white", activebackground="#1a4a8a",
+    )
+
 
 def build_main_window():
     global _root, _region_label, _status_label, _translate_btn
@@ -782,21 +771,8 @@ def build_main_window():
     _lang_var = tk.StringVar(value=LANG_PAIRS[_lang_pair_idx][0])
     _lang_var.trace_add("write", on_lang_change)
 
-    lang_labels = [p[0] for p in LANG_PAIRS]
-    opt_menu = tk.OptionMenu(lang_frame, _lang_var, *lang_labels)
-    opt_menu.config(
-        font=("Malgun Gothic", 9),
-        fg="white", bg="#0f3460",
-        activeforeground="white", activebackground="#1a4a8a",
-        relief="flat", cursor="hand2",
-        highlightthickness=0, bd=0,
-        anchor="w", width=26,
-    )
-    opt_menu["menu"].config(
-        font=("Malgun Gothic", 9),
-        fg="white", bg="#0f3460",
-        activeforeground="white", activebackground="#1a4a8a",
-    )
+    opt_menu = tk.OptionMenu(lang_frame, _lang_var, *[p[0] for p in LANG_PAIRS])
+    _style_option_menu(opt_menu)
     opt_menu.pack(fill="x")
 
     # ── 전처리 프리셋 드롭다운 ────────────────────────────────
@@ -818,7 +794,6 @@ def build_main_window():
 
     def _on_preprocess_change_with_desc(*_):
         on_preprocess_change()
-        # 선택한 프리셋의 설명 텍스트 갱신
         label = _preprocess_var.get()
         for preset in PREPROCESS_PRESETS:
             if preset[0] == label:
@@ -827,21 +802,8 @@ def build_main_window():
 
     _preprocess_var.trace_add("write", _on_preprocess_change_with_desc)
 
-    pre_labels = [p[0] for p in PREPROCESS_PRESETS]
-    pre_menu = tk.OptionMenu(pre_frame, _preprocess_var, *pre_labels)
-    pre_menu.config(
-        font=("Malgun Gothic", 9),
-        fg="white", bg="#0f3460",
-        activeforeground="white", activebackground="#1a4a8a",
-        relief="flat", cursor="hand2",
-        highlightthickness=0, bd=0,
-        anchor="w", width=26,
-    )
-    pre_menu["menu"].config(
-        font=("Malgun Gothic", 9),
-        fg="white", bg="#0f3460",
-        activeforeground="white", activebackground="#1a4a8a",
-    )
+    pre_menu = tk.OptionMenu(pre_frame, _preprocess_var, *[p[0] for p in PREPROCESS_PRESETS])
+    _style_option_menu(pre_menu)
     pre_menu.pack(fill="x")
 
     # ── OCR 텍스트 정리 옵션 체크박스 ────────────────────────
@@ -883,7 +845,7 @@ def build_main_window():
                    cursor="hand2", pady=7)
 
     tk.Button(btn_frame, text="📐  영역 설정",
-              command=on_region_click,
+              command=select_region,
               fg="white", bg="#0f3460",
               activebackground="#1a4a8a", activeforeground="white",
               **btn_cfg).pack(fill="x", pady=(0, 6))

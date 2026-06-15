@@ -1,12 +1,12 @@
 {
   "capture_region": [
-    273,
-    481,
-    1194,
-    548
+    239,
+    709,
+    1564,
+    841
   ],
   "lang_pair_idx": 0,
-  "preprocess_idx": 0,
-  "remove_newline": true,
+  "preprocess_idx": 2,
+  "remove_newline": false,
   "remove_space": true
 }
