@@ -29,7 +29,7 @@ def get_query(url):
     return None
 
 # 게시물 url을 수집한다
-def get_ntt_url_list(bbs_url_list, max_page):
+def get_ntt_url_list(bbs_url_list, max_page, sys_id):
     ntt_url_list = []
     for bbs_url in bbs_url_list:
         parsed_url = urlparse(bbs_url)
@@ -44,7 +44,7 @@ def get_ntt_url_list(bbs_url_list, max_page):
             soup = get_query(url)
             links = soup.select('.nttInfoBtn')
             for link in links:
-                ntt_url_list.append(f'https://www.dju.ac.kr/dju/na/ntt/selectNttInfo.do?nttSn={link.get('data-id')}&bbsId={bbsId}&mi={mi}')
+                ntt_url_list.append(f'https://www.dju.ac.kr/{sys_id}/na/ntt/selectNttInfo.do?bbsId={bbsId}&nttSn={link.get('data-id')}&mi={mi}')
     
     return ntt_url_list
 
@@ -53,9 +53,13 @@ def search_ntt_contents(ntt_url):
     soup = get_query(ntt_url)
     
     contents = soup.select_one('.BD_table table .Cnts')
+
+    if not contents:
+        return None
+
     imgs = contents.select('img')
     tables = contents.select('table')
-    a = contents.select('a[target="_blank"]')
+    a = contents.select('a[target]:not([target="_self"])')
 
     if not imgs and not tables and not a:
         return None
@@ -153,6 +157,7 @@ def save_to_excel(ntt_content_list):
 
 def main():
     bbs_url_list = []
+    sys_id = input('시스템 아이디 입력 : ')
 
     while True:
         url = input('게시판의 URL 입력 : ')
@@ -167,7 +172,7 @@ def main():
     
     max_page = int(input('최대 페이지 수를 입력 : '))
     print('게시물 url 수집 중...')
-    ntt_url_list = get_ntt_url_list(bbs_url_list, max_page)
+    ntt_url_list = get_ntt_url_list(bbs_url_list, max_page, sys_id)
     print('게시물 url 수집 완료')
     ntt_url_list = list(set(ntt_url_list))
     # 게시물 돌아다니면서 내용을 검출하고 검출된 내용을 저장한다
