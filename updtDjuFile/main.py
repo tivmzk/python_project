@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
+import re
 import threading
 import requests
 from bs4 import BeautifulSoup
@@ -15,12 +16,59 @@ URL_MAP = {
     '7': 'https://www.dju.ac.kr/dju/cm/cntnts/cntntsView.do?cntntsId=2647&mi=4327',
 }
 
+CONTENT_START = '<!-- 페이지뷰 : 서브콘텐츠 시작-->'
+CONTENT_END = '<!-- //페이지뷰 : 서브콘텐츠 끝 -->'
+
 
 def get_query(dtl, file_url):
     return f"UPDATE TSA_ATCH_FILE_DETAIL SET FILE_DTLS = '{dtl}' WHERE FILE_STRE_COURS = '{file_url}';"
 
 
-def fetch_queries(url, file_num_list, log):
+def extract_content(page_html):
+    """콘텐츠 영역만 잘라낸다. 탭메뉴(.tab_st1_box)와 UPPER TAB 주석들은 마지막 시작 주석보다 앞에 있어 제외된다."""
+    start = page_html.rfind(CONTENT_START)
+    end = page_html.find(CONTENT_END, start) if start != -1 else -1
+    if end != -1:
+        return page_html[start:end + len(CONTENT_END)]
+
+    # 시작/끝 주석이 없으면 div.subCntBody 안쪽에서 탭메뉴와 앞뒤 주석을 걷어낸다
+    body = re.search(r'<div[^>]*class="[^"]*\bsubCntBody\b[^"]*"[^>]*>', page_html)
+    if not body:
+        return None
+    body_end = find_div_end(page_html, body.end())
+    if body_end is None:
+        return None
+    inner = page_html[body.end():body_end]
+
+    while True:
+        tab = re.search(r'<div[^>]*class="[^"]*\btab_st1_box\b[^"]*"[^>]*>', inner)
+        if not tab:
+            break
+        tab_end = find_div_end(inner, tab.end())
+        if tab_end is None:
+            break
+        inner = inner[:tab.start()] + inner[inner.index('>', tab_end) + 1:]
+
+    inner = re.sub(r'^(\s*<!--.*?-->)*\s*', '', inner, flags=re.S)
+    inner = re.sub(r'(\s*<!--(?:(?!-->).)*-->)*\s*$', '', inner, flags=re.S)
+    return inner or None
+
+
+def find_div_end(html, pos):
+    """pos(여는 div 태그 바로 뒤)에서 시작해 짝이 맞는 </div>의 시작 위치를 찾는다."""
+    depth = 1
+    for m in re.finditer(r'<!--.*?-->|<div\b|</div\s*>', html[pos:], flags=re.S):
+        token = m.group()
+        if token.startswith('<!--'):
+            continue
+        depth += 1 if token.startswith('<div') else -1
+        if depth == 0:
+            return pos + m.start()
+    return None
+
+
+def fetch_page(url, pairs, log):
+    """pairs: [(파일 번호, 새 경로 또는 None)] → (기존 파일 쿼리 목록, 페이지 제목, 수정된 콘텐츠 html 또는 None)"""
     try:
         log(f"[조회] {url}")
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -29,8 +77,16 @@ def fetch_queries(url, file_num_list, log):
         soup = BeautifulSoup(resp.text, 'html.parser')
         all_td = soup.select('.tbl_st td')
 
+        title_tag = soup.select_one('h2.pageTitle')
+        title = title_tag.get_text(strip=True) if title_tag else url
+        # BeautifulSoup으로 다시 직렬화하면 원본 html이 변형되므로 원문 문자열에서 href만 교체한다
+        content = extract_content(resp.text)
+        if content is None:
+            log("  [경고] 콘텐츠 영역을 찾지 못해 html은 수정하지 않습니다.")
+        replaced = 0
+
         result = []
-        for file_num in file_num_list:
+        for file_num, new_path in pairs:
             temp = ''
             search_num = file_num
             if file_num.startswith('3-1-2_'):
@@ -51,26 +107,44 @@ def fetch_queries(url, file_num_list, log):
                 result.append(get_query('', href))
                 log(f"  ✓ {file_num} → {href}")
                 found = True
+
+                if new_path and content is not None:
+                    old_attr = f'href="{href}"'
+                    if content.count(old_attr) == 1:
+                        content = content.replace(old_attr, f'href="{new_path}"')
+                        replaced += 1
+                        log(f"    ↳ html 링크 교체 → {new_path}")
+                    else:
+                        log(f"    [경고] html에서 링크를 특정하지 못해 교체하지 않았습니다. ({content.count(old_attr)}건)")
                 break
             if not found:
                 log(f"  ✗ {file_num} 미발견")
-        return result
+        return result, title, content if replaced else None
     except Exception as e:
         log(f"[오류] {e}")
-        return []
+        return [], url, None
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("대전대 규정 파일 쿼리 생성기")
-        self.geometry("780x740")
-        self.minsize(620, 540)
+        self.geometry("780x880")
+        self.minsize(620, 680)
+        self.pages = []  # [(페이지 제목, 수정된 콘텐츠 html)]
         self._build_ui()
 
     def _build_ui(self):
         main = ttk.Frame(self, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            main,
+            text="※ ①의 번호와 ②의 경로는 입력한 순서대로 짝이 됩니다. (첫 번째 번호 ↔ 첫 번째 경로)\n"
+                 "   콘텐츠 html의 링크를 교체하려면 반드시 같은 순서, 같은 개수로 입력해 주세요.",
+            foreground='#c00000',
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=4, pady=(0, 4))
 
         # ── 1. 기존 파일 번호 ─────────────────────────────────────
         num_frame = ttk.LabelFrame(
@@ -141,6 +215,18 @@ class App(tk.Tk):
         self.status_lbl = ttk.Label(run_row, textvariable=self.status_var)
         self.status_lbl.pack(side=tk.LEFT, padx=10)
 
+        # ── 5. 수정된 콘텐츠 html ─────────────────────────────────
+        # 결과 영역이 expand하기 전에 먼저 pack해야 밀려나지 않음
+        html_frame = ttk.LabelFrame(main, text="④ 수정된 콘텐츠 html  (페이지 선택 후 복사)", padding=8)
+        html_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=4)
+        self.page_lb = tk.Listbox(html_frame, height=3, selectmode=tk.SINGLE, activestyle='dotbox', exportselection=False)
+        pgs = ttk.Scrollbar(html_frame, orient=tk.VERTICAL, command=self.page_lb.yview)
+        self.page_lb.config(yscrollcommand=pgs.set)
+        self.page_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        pgs.pack(side=tk.LEFT, fill=tk.Y)
+        self.page_lb.bind('<Double-Button-1>', lambda _: self._copy_html())
+        ttk.Button(html_frame, text="html 복사", command=self._copy_html, width=10).pack(side=tk.LEFT, padx=(6, 0))
+
         # ── 4. 결과 ───────────────────────────────────────────────
         result_frame = ttk.LabelFrame(main, text="③ 생성된 쿼리", padding=8)
         result_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -158,6 +244,7 @@ class App(tk.Tk):
             txt_area,
             font=("Consolas", 9),
             wrap=tk.NONE,
+            height=10,
             state=tk.DISABLED,
             yscrollcommand=v_sc.set,
             xscrollcommand=h_sc.set,
@@ -244,23 +331,41 @@ class App(tk.Tk):
         def log(msg):
             logs.append(msg)
 
+        # 번호와 경로는 입력 순서대로 짝을 맞춘다. 개수가 다르면 잘못 짝지어질 수 있어 html은 건드리지 않는다
+        if len(file_nums) == len(new_paths):
+            pairs = list(zip(file_nums, new_paths))
+        else:
+            pairs = [(fn, None) for fn in file_nums]
+            if new_paths:
+                log(f"[경고] 번호({len(file_nums)}개)와 경로({len(new_paths)}개)의 개수가 달라 콘텐츠 html은 수정하지 않습니다.")
+
         num_map = {}
-        for fn in file_nums:
-            key = fn.split('-')[0]
-            num_map.setdefault(key, []).append(fn)
+        for pair in pairs:
+            key = pair[0].split('-')[0]
+            num_map.setdefault(key, []).append(pair)
 
         old_queries = []
-        for key, nums in num_map.items():
+        pages = []
+        for key, page_pairs in num_map.items():
             if key not in URL_MAP:
                 log(f"[경고] 알 수 없는 분류 키: {key}")
                 continue
-            old_queries.extend(fetch_queries(URL_MAP[key], nums, log))
+            queries, title, html = fetch_page(URL_MAP[key], page_pairs, log)
+            old_queries.extend(queries)
+            if html:
+                pages.append((title, html))
 
         new_queries = [get_query('대학규정', p) for p in new_paths]
-        self.after(0, self._run_done, logs, old_queries, new_queries)
+        self.after(0, self._run_done, logs, old_queries, new_queries, pages)
 
-    def _run_done(self, logs, old_queries, new_queries):
+    def _run_done(self, logs, old_queries, new_queries, pages):
         self.run_btn.config(state=tk.NORMAL)
+
+        self.pages = pages
+        for title, _ in pages:
+            self.page_lb.insert(tk.END, title)
+        if pages:
+            self.page_lb.selection_set(0)
 
         def append(text, tag=None):
             self.result_text.config(state=tk.NORMAL)
@@ -306,6 +411,18 @@ class App(tk.Tk):
         pyperclip.copy('\n'.join(sql_lines))
         self._set_status("SQL 쿼리가 클립보드에 복사되었습니다!", "green")
 
+    def _copy_html(self):
+        if not self.pages:
+            messagebox.showinfo("알림", "수정된 콘텐츠 html이 없습니다.")
+            return
+        sel = self.page_lb.curselection()
+        if not sel:
+            messagebox.showinfo("알림", "복사할 페이지를 선택해 주세요.")
+            return
+        title, html = self.pages[sel[0]]
+        pyperclip.copy(html)
+        self._set_status(f"[{title}] 콘텐츠 html이 클립보드에 복사되었습니다!", "green")
+
     # ── 유틸 ─────────────────────────────────────────────────────
 
     def _set_status(self, msg, color="black"):
@@ -316,6 +433,8 @@ class App(tk.Tk):
         self.result_text.config(state=tk.NORMAL)
         self.result_text.delete('1.0', tk.END)
         self.result_text.config(state=tk.DISABLED)
+        self.pages = []
+        self.page_lb.delete(0, tk.END)
 
 
 if __name__ == '__main__':
