@@ -16,12 +16,30 @@ URL_MAP = {
     '7': 'https://www.dju.ac.kr/dju/cm/cntnts/cntntsView.do?cntntsId=2647&mi=4327',
 }
 
+# 파일 번호(예: 2-0-1). 파일명 앞에 붙어 있어도 되고, 3-1-2는 _1(기구표)/_2(직제규정)를 붙일 수 있다
+FILE_NUM_RE = re.compile(r'(\d+(?:-\d+)+)(_[12])?')
+
 CONTENT_START = '<!-- 페이지뷰 : 서브콘텐츠 시작-->'
 CONTENT_END = '<!-- //페이지뷰 : 서브콘텐츠 끝 -->'
 
 
 def get_query(dtl, file_url):
     return f"UPDATE TSA_ATCH_FILE_DETAIL SET FILE_DTLS = '{dtl}' WHERE FILE_STRE_COURS = '{file_url}';"
+
+
+def split_db_row(line):
+    """'경로<탭>파일명' 또는 '파일명<탭>경로' 한 줄을 (경로, 파일명)으로 나눈다. 경로는 /로 시작하는 쪽이다."""
+    parts = [p.strip() for p in line.split('\t') if p.strip()]
+    if len(parts) < 2:
+        # 탭이 공백으로 바뀌어 붙여넣어진 경우
+        m = re.match(r'^(/\S+)\s+(.+)$', line) or re.match(r'^(.+?)\s+(/\S+)$', line)
+        if not m:
+            return None
+        parts = list(m.groups())
+    paths = [p for p in parts if p.startswith('/')]
+    if len(paths) != 1:
+        return None
+    return paths[0], ' '.join(p for p in parts if p != paths[0])
 
 
 def extract_content(page_html):
@@ -129,8 +147,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("대전대 규정 파일 쿼리 생성기")
-        self.geometry("780x880")
-        self.minsize(620, 680)
+        self.geometry("800x900")
+        self.minsize(640, 720)
         self.pages = []  # [(페이지 제목, 수정된 콘텐츠 html)]
         self._build_ui()
 
@@ -138,73 +156,54 @@ class App(tk.Tk):
         main = ttk.Frame(self, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(
+        # ── 1. 기존 파일 번호 + 새 파일 경로 ──────────────────────
+        pair_frame = ttk.LabelFrame(
             main,
-            text="※ ①의 번호와 ②의 경로는 입력한 순서대로 짝이 됩니다. (첫 번째 번호 ↔ 첫 번째 경로)\n"
-                 "   콘텐츠 html의 링크를 교체하려면 반드시 같은 순서, 같은 개수로 입력해 주세요.",
-            foreground='#c00000',
-            justify=tk.LEFT,
-        ).pack(fill=tk.X, padx=4, pady=(0, 4))
-
-        # ── 1. 기존 파일 번호 ─────────────────────────────────────
-        num_frame = ttk.LabelFrame(
-            main,
-            text="① 기존 파일 번호  (예: 1-0-1 / 3-1-2_1 기구표 / 3-1-2_2 직제규정)",
+            text="① 기존 파일 번호 + 새 파일 경로",
             padding=8
         )
-        num_frame.pack(fill=tk.X, padx=4, pady=4)
+        pair_frame.pack(fill=tk.X, padx=4, pady=4)
 
-        inp_row = ttk.Frame(num_frame)
+        inp_row = ttk.Frame(pair_frame)
         inp_row.pack(fill=tk.X)
-        ttk.Label(inp_row, text="번호:").pack(side=tk.LEFT)
-        self.num_var = tk.StringVar()
-        self.num_entry = ttk.Entry(inp_row, textvariable=self.num_var, width=14)
-        self.num_entry.pack(side=tk.LEFT, padx=4)
-        self.num_entry.bind('<Return>', lambda _: self._add_num())
-        ttk.Button(inp_row, text="추가", command=self._add_num).pack(side=tk.LEFT)
+        inp_row.columnconfigure(0, weight=2)
+        inp_row.columnconfigure(1, weight=3)
+        ttk.Label(inp_row, text="번호 또는 파일명 (한 줄에 하나)").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(inp_row, text="새 경로 (한 줄에 하나)").grid(row=0, column=1, sticky=tk.W, padx=(6, 0))
+        self.num_text = tk.Text(inp_row, height=4, width=30, wrap=tk.NONE, undo=True)
+        self.num_text.grid(row=1, column=0, sticky=tk.EW)
+        self.path_text = tk.Text(inp_row, height=4, width=45, wrap=tk.NONE, undo=True)
+        self.path_text.grid(row=1, column=1, sticky=tk.EW, padx=(6, 0))
+        ttk.Button(inp_row, text="추가", command=self._add_pairs, width=8).grid(row=1, column=2, sticky=tk.N, padx=(6, 0))
+        for txt in (self.num_text, self.path_text):
+            txt.bind('<Control-Return>', lambda _: self._add_pairs() or 'break')
+            txt.bind('<Tab>', lambda e: e.widget.tk_focusNext().focus() or 'break')
 
-        list_row = ttk.Frame(num_frame)
+        ttk.Label(
+            pair_frame,
+            text="※ 여러 줄을 한번에 붙여넣을 수 있고, 두 칸의 같은 줄끼리 짝이 됩니다. (추가: 버튼 또는 Ctrl+Enter)\n"
+                 "   번호 칸에 파일명(예: 5-0-1.중앙도서관규정.pdf)을 넣으면 앞의 번호만 추출합니다.\n"
+                 "   DB 조회 결과(경로 + 파일명, 순서 무관)는 한쪽 칸에만 그대로 붙여넣으면 자동으로 나눠집니다.",
+            foreground='#666666',
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(4, 0))
+
+        list_row = ttk.Frame(pair_frame)
         list_row.pack(fill=tk.X, pady=(6, 0))
-        self.num_lb = tk.Listbox(list_row, height=4, selectmode=tk.SINGLE, activestyle='dotbox')
-        ns = ttk.Scrollbar(list_row, orient=tk.VERTICAL, command=self.num_lb.yview)
-        self.num_lb.config(yscrollcommand=ns.set)
-        self.num_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ns.pack(side=tk.LEFT, fill=tk.Y)
-        nb = ttk.Frame(list_row)
-        nb.pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(nb, text="삭제", command=self._del_num, width=8).pack(pady=1)
-        ttk.Button(nb, text="전체 삭제", command=lambda: self.num_lb.delete(0, tk.END), width=8).pack(pady=1)
-
-        # ── 2. 새 파일 경로 ───────────────────────────────────────
-        path_frame = ttk.LabelFrame(
-            main,
-            text="② 새 파일 경로  (예: /upload/cntntsFile/dju/doc_xxx.pdf)",
-            padding=8
-        )
-        path_frame.pack(fill=tk.X, padx=4, pady=4)
-
-        path_inp = ttk.Frame(path_frame)
-        path_inp.pack(fill=tk.X)
-        ttk.Label(path_inp, text="경로:").pack(side=tk.LEFT)
-        self.path_var = tk.StringVar()
-        self.path_entry = ttk.Entry(path_inp, textvariable=self.path_var)
-        self.path_entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
-        self.path_entry.bind('<Return>', lambda _: self._add_path())
-        ttk.Button(path_inp, text="추가", command=self._add_path).pack(side=tk.LEFT)
-
-        path_list = ttk.Frame(path_frame)
-        path_list.pack(fill=tk.X, pady=(6, 0))
-        self.path_lb = tk.Listbox(path_list, height=4, selectmode=tk.SINGLE, activestyle='dotbox')
-        ps = ttk.Scrollbar(path_list, orient=tk.VERTICAL, command=self.path_lb.yview)
-        phs = ttk.Scrollbar(path_list, orient=tk.HORIZONTAL, command=self.path_lb.xview)
-        self.path_lb.config(yscrollcommand=ps.set, xscrollcommand=phs.set)
-        phs.pack(side=tk.BOTTOM, fill=tk.X)
-        self.path_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ps.pack(side=tk.LEFT, fill=tk.Y)
-        pb = ttk.Frame(path_list)
-        pb.pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(pb, text="삭제", command=self._del_path, width=8).pack(pady=1)
-        ttk.Button(pb, text="전체 삭제", command=lambda: self.path_lb.delete(0, tk.END), width=8).pack(pady=1)
+        self.pair_tv = ttk.Treeview(list_row, columns=('num', 'path'), show='headings', height=6, selectmode='browse')
+        self.pair_tv.heading('num', text='기존 파일 번호')
+        self.pair_tv.heading('path', text='새 파일 경로')
+        self.pair_tv.column('num', width=110, stretch=False)
+        self.pair_tv.column('path', width=480)
+        ts = ttk.Scrollbar(list_row, orient=tk.VERTICAL, command=self.pair_tv.yview)
+        self.pair_tv.config(yscrollcommand=ts.set)
+        self.pair_tv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ts.pack(side=tk.LEFT, fill=tk.Y)
+        self.pair_tv.bind('<Delete>', lambda _: self._del_pair())
+        tb = ttk.Frame(list_row)
+        tb.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(tb, text="삭제", command=self._del_pair, width=8).pack(pady=1)
+        ttk.Button(tb, text="전체 삭제", command=lambda: self.pair_tv.delete(*self.pair_tv.get_children()), width=8).pack(pady=1)
 
         # ── 3. 실행 ───────────────────────────────────────────────
         run_row = ttk.Frame(main)
@@ -217,7 +216,7 @@ class App(tk.Tk):
 
         # ── 5. 수정된 콘텐츠 html ─────────────────────────────────
         # 결과 영역이 expand하기 전에 먼저 pack해야 밀려나지 않음
-        html_frame = ttk.LabelFrame(main, text="④ 수정된 콘텐츠 html  (페이지 선택 후 복사)", padding=8)
+        html_frame = ttk.LabelFrame(main, text="③ 수정된 콘텐츠 html  (페이지 선택 후 복사)", padding=8)
         html_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=4)
         self.page_lb = tk.Listbox(html_frame, height=3, selectmode=tk.SINGLE, activestyle='dotbox', exportselection=False)
         pgs = ttk.Scrollbar(html_frame, orient=tk.VERTICAL, command=self.page_lb.yview)
@@ -228,7 +227,7 @@ class App(tk.Tk):
         ttk.Button(html_frame, text="html 복사", command=self._copy_html, width=10).pack(side=tk.LEFT, padx=(6, 0))
 
         # ── 4. 결과 ───────────────────────────────────────────────
-        result_frame = ttk.LabelFrame(main, text="③ 생성된 쿼리", padding=8)
+        result_frame = ttk.LabelFrame(main, text="② 생성된 쿼리", padding=8)
         result_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         # 복사 버튼을 먼저 pack해야 텍스트 영역이 expand할 때 밀려나지 않음
@@ -260,84 +259,106 @@ class App(tk.Tk):
         self.result_text.tag_config('comment', foreground='#008000')
         self.result_text.tag_config('sql',     foreground='#000080')
 
-    # ── 파일 번호 ────────────────────────────────────────────────
+    # ── 번호 + 경로 입력 ─────────────────────────────────────────
 
-    def _add_num(self):
-        num = self.num_var.get().strip()
-        if not num:
-            return
-        if num == '3-1-2':
-            self._ask_312()
-            return
-        self.num_lb.insert(tk.END, num)
-        self.num_var.set('')
-        self.num_entry.focus()
+    def _add_pairs(self):
+        num_lines = [l.strip() for l in self.num_text.get('1.0', tk.END).splitlines() if l.strip()]
+        path_lines = [l.strip() for l in self.path_text.get('1.0', tk.END).splitlines() if l.strip()]
 
-    def _ask_312(self):
+        # DB 조회 결과(경로 + 파일명)를 한쪽 칸에만 그대로 붙여넣은 경우. 칸과 순서는 상관없다
+        if bool(num_lines) != bool(path_lines):
+            rows = [split_db_row(l) for l in num_lines or path_lines]
+            if all(rows):
+                path_lines = [p for p, _ in rows]
+                num_lines = [n for _, n in rows]
+
+        if not num_lines:
+            messagebox.showwarning("입력 필요", "기존 파일 번호(또는 파일명)를 입력해 주세요.")
+            self.num_text.focus()
+            return
+        if not path_lines:
+            messagebox.showwarning("입력 필요", "새 파일 경로를 입력해 주세요.")
+            self.path_text.focus()
+            return
+        if len(num_lines) != len(path_lines):
+            messagebox.showwarning(
+                "개수 불일치",
+                f"번호는 {len(num_lines)}줄, 경로는 {len(path_lines)}줄입니다.\n줄 수가 같아야 짝을 맞출 수 있습니다."
+            )
+            return
+
+        no_num = [l for l in num_lines if not FILE_NUM_RE.match(l)]
+        if no_num:
+            messagebox.showwarning(
+                "번호 없음",
+                "다음 항목에서 파일 번호를 찾지 못해 추가하지 않았습니다.\n\n" + "\n".join(f"· {l}" for l in no_num)
+            )
+            return
+
+        pairs = []
+        for line, path in zip(num_lines, path_lines):
+            m = FILE_NUM_RE.match(line)
+            num = m.group(1)
+            if num == '3-1-2':
+                kind = (m.group(2) or '').lstrip('_')
+                if not kind:
+                    rest = line[m.end():]
+                    kind = '1' if '기구표' in rest else '2' if '직제' in rest else self._ask_312(path)
+                if not kind:
+                    return
+                num = f"3-1-2_{kind}"
+            pairs.append((num, path))
+
+        for pair in pairs:
+            self.pair_tv.insert('', tk.END, values=pair)
+        self.num_text.delete('1.0', tk.END)
+        self.path_text.delete('1.0', tk.END)
+        self.num_text.focus()
+
+    def _ask_312(self, path):
+        """기구표/직제규정 중 어느 3-1-2인지 묻는다. 창을 그냥 닫으면 None."""
         dlg = tk.Toplevel(self)
         dlg.title("3-1-2 유형 선택")
         dlg.resizable(False, False)
+        dlg.transient(self)
         dlg.grab_set()
-        dlg.geometry("240x100")
-        ttk.Label(dlg, text="어떤 3-1-2를 추가할까요?").pack(pady=12)
+        ttk.Label(dlg, text=f"어떤 3-1-2를 추가할까요?\n{path}", justify=tk.CENTER).pack(padx=16, pady=12)
         row = ttk.Frame(dlg)
-        row.pack()
+        row.pack(pady=(0, 12))
+        picked = []
 
         def pick(val):
-            self.num_lb.insert(tk.END, f"3-1-2_{val}")
-            self.num_var.set('')
+            picked.append(val)
             dlg.destroy()
-            self.num_entry.focus()
 
         ttk.Button(row, text="1 - 기구표",   command=lambda: pick('1'), width=12).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="2 - 직제규정", command=lambda: pick('2'), width=12).pack(side=tk.LEFT, padx=4)
+        self.wait_window(dlg)
+        return picked[0] if picked else None
 
-    def _del_num(self):
-        sel = self.num_lb.curselection()
+    def _del_pair(self):
+        sel = self.pair_tv.selection()
         if sel:
-            self.num_lb.delete(sel[0])
-
-    # ── 새 파일 경로 ─────────────────────────────────────────────
-
-    def _add_path(self):
-        p = self.path_var.get().strip()
-        if not p:
-            return
-        self.path_lb.insert(tk.END, p)
-        self.path_var.set('')
-        self.path_entry.focus()
-
-    def _del_path(self):
-        sel = self.path_lb.curselection()
-        if sel:
-            self.path_lb.delete(sel[0])
+            self.pair_tv.delete(sel[0])
 
     # ── 실행 ─────────────────────────────────────────────────────
 
     def _run(self):
-        file_nums = list(self.num_lb.get(0, tk.END))
-        if not file_nums:
-            messagebox.showwarning("입력 필요", "기존 파일 번호를 하나 이상 입력해 주세요.")
+        # Treeview는 숫자처럼 보이는 값을 int로 돌려줄 수 있어 str로 맞춘다
+        pairs = [tuple(str(v) for v in self.pair_tv.item(i, 'values')) for i in self.pair_tv.get_children()]
+        if not pairs:
+            messagebox.showwarning("입력 필요", "기존 파일 번호와 새 파일 경로를 하나 이상 입력해 주세요.")
             return
         self.run_btn.config(state=tk.DISABLED)
         self._set_status("조회 중...", "blue")
         self._clear_result()
-        new_paths = list(self.path_lb.get(0, tk.END))
-        threading.Thread(target=self._run_bg, args=(file_nums, new_paths), daemon=True).start()
+        threading.Thread(target=self._run_bg, args=(pairs,), daemon=True).start()
 
-    def _run_bg(self, file_nums, new_paths):
+    def _run_bg(self, pairs):
         logs = []
 
         def log(msg):
             logs.append(msg)
-
-        # 번호와 경로는 입력 순서대로 짝을 맞춘다. 개수가 다르면 잘못 짝지어질 수 있어 html은 건드리지 않는다
-        if len(file_nums) == len(new_paths):
-            pairs = list(zip(file_nums, new_paths))
-        else:
-            pairs = [(fn, None) for fn in file_nums]
-            if new_paths:
-                log(f"[경고] 번호({len(file_nums)}개)와 경로({len(new_paths)}개)의 개수가 달라 콘텐츠 html은 수정하지 않습니다.")
 
         num_map = {}
         for pair in pairs:
@@ -355,7 +376,7 @@ class App(tk.Tk):
             if html:
                 pages.append((title, html))
 
-        new_queries = [get_query('대학규정', p) for p in new_paths]
+        new_queries = [get_query('대학규정', p) for _, p in pairs]
         self.after(0, self._run_done, logs, old_queries, new_queries, pages)
 
     def _run_done(self, logs, old_queries, new_queries, pages):
